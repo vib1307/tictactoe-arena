@@ -1,0 +1,25 @@
+# deploy.config — copy to deploy/deploy.config and fill in.
+# deploy/deploy.config is git-ignored (it holds your DuckDNS token).
+
+# ── SSH target (your EC2 instance) ───────────────────────────────────────────
+EC2_HOST="1.2.3.4"                 # public IP or myarena.duckdns.org
+EC2_USER="ubuntu"                  # "ubuntu" on Ubuntu AMIs, "ec2-user" on Amazon Linux
+SSH_KEY="$HOME/.ssh/my-ec2-key.pem"
+
+# ── App on the server ────────────────────────────────────────────────────────
+APP_DIR="/home/$EC2_USER/tictactoe-arena"   # code + venv + .env live here
+APP_PORT="7860"
+HUMAN_CONCURRENCY="8"              # parallel human-vs-AI moves Gradio will run
+
+# ── DuckDNS (free dynamic DNS) ───────────────────────────────────────────────
+DUCKDNS_SUBDOMAIN="myarena"        # just the part before .duckdns.org
+DUCKDNS_TOKEN="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# ── Reverse proxy / HTTPS ────────────────────────────────────────────────────
+# yes → nginx on :80 (and :443) proxies to the app on 127.0.0.1:$APP_PORT
+# no  → the app listens on 0.0.0.0:$APP_PORT directly (open that port in the SG)
+ENABLE_NGINX="yes"
+# yes → free Let's Encrypt cert for <subdomain>.duckdns.org (needs ENABLE_NGINX=yes
+#        and ports 80+443 open in the security group)
+ENABLE_HTTPS="yes"
+CERTBOT_EMAIL="you@example.com"

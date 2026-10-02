@@ -79,7 +79,9 @@ def cell_label(i):
     return "abc"[i % 3] + str(i // 3 + 1)
 
 # ── SVG + view rendering (same as before) ────────────────────────────────────
-def board_svg(board, last=None):
+def board_svg(board, last=None, clickable=False):
+    # clickable=True (human's turn) adds an invisible hit-box on every empty
+    # cell carrying data-cell=<i>; BOARD_JS turns a click on it into an event.
     p = []
     for k in (1, 2):
         p.append(f'<line x1="{k*100}" y1="6" x2="{k*100}" y2="294" class="grid"/>')
@@ -93,6 +95,9 @@ def board_svg(board, last=None):
             p.append(f'<line x1="{x+70}" y1="{y+30}" x2="{x+30}" y2="{y+70}" class="xg"/>')
         elif board[i] == O:
             p.append(f'<circle cx="{x+50}" cy="{y+50}" r="22" class="og"/>')
+        elif clickable:
+            p.append(f'<rect x="{x+5}" y="{y+5}" width="90" height="90" rx="6" '
+                     f'class="hit" data-cell="{i}"/>')
     return f'<svg viewBox="0 0 300 300" class="board">{"".join(p)}</svg>'
 
 def panel(side, name, s, active):
@@ -121,19 +126,20 @@ def log_html(log):
                     f'<span class="lreason">{html.escape(reason)}</span></div>')
     return "".join(rows)
 
-def view(board, last, stats, names, current, status, elapsed, result, log):
+def view(board, last, stats, names, current, status, elapsed, result, log,
+         label="single match", clickable=False):
     banner = f'<div class="result">{html.escape(result)}</div>' if result else ""
     dot = "live" if not result else "done"
     return f"""<style>{CSS}</style>
     <div id="arena">
       <div class="topbar">
-        <div class="left"><span class="dot {dot}"></span> {'LIVE' if not result else 'FINAL'} · single match</div>
+        <div class="left"><span class="dot {dot}"></span> {'LIVE' if not result else 'FINAL'} · {label}</div>
         <div class="right">{elapsed:04.1f}s elapsed</div>
       </div>
       <div class="main">
         {panel("X", names["X"], stats["X"], current == "X")}
         <div class="center">
-          {board_svg(board, last)}
+          {board_svg(board, last, clickable)}
           <div class="status">{html.escape(status)}</div>
           {banner}
         </div>
@@ -225,6 +231,149 @@ def play(identity, x_choice, o_choice):
     db.log_game(user_id, name, ip, x_choice, o_choice, result_side,
                 [{"n": n_, "side": sd, "cell": cl, "reasoning": rs} for n_, sd, cl, rs in log])
 
+# ── human vs model: one game lives in a per-session gr.State dict ───────────
+# Unlike play(), a human game spans many events (start + one per click), so
+# the board/stats/log are kept in state instead of local variables.
+HUMAN_LABEL = "human vs model"
+
+def _hview(g, status, result=None, thinking=False):
+    current = None if g["over"] else (g["ai"] if thinking else g["human"])
+    return view(g["board"], g["last"], g["stats"], g["names"], current, status,
+                time.time() - g["start"], result, g["log"],
+                label=HUMAN_LABEL, clickable=not g["over"] and not thinking)
+
+def _record(g, side, cell, reasoning):
+    apply_move(g["board"], cell, side)
+    g["last"], g["n"] = cell, g["n"] + 1
+    g["log"].append((g["n"], side, cell_label(cell), reasoning))
+
+def _log_human_game(g, result_side):
+    name, ip, user_id = g["identity"]
+    human = f"human:{name}"
+    x_name, o_name = (human, g["model"]) if g["human"] == "X" else (g["model"], human)
+    db.log_game(user_id, name, ip, x_name, o_name, result_side,
+                [{"n": n_, "side": sd, "cell": cl, "reasoning": rs} for n_, sd, cl, rs in g["log"]],
+                mode="human_vs_ai")
+
+def _check_end(g):
+    """If the game is over: mark it, log it, return the result text. Else None."""
+    w = winner(g["board"])
+    if w is not None:
+        side = SYMBOL[w]                         # winner() returns X/O ints
+        res = "You win!" if side == g["human"] else f"{g['model']} wins!"
+    elif is_draw(g["board"]):
+        res, side = "Draw", "draw"
+    else:
+        return None
+    g["over"] = True
+    _log_human_game(g, side)
+    return res
+
+def _ai_turn(g):
+    """Generator: show 'thinking', ask the model for a move, apply it."""
+    ai = g["ai"]
+    g["turn"] = ai
+    yield _hview(g, f"{g['model']} thinking…", thinking=True), g
+    client, model = MODELS[g["model"]]
+    try:
+        rec = get_move_record(client, model, g["board"], ai)
+    except Exception as e:                       # API down / quota / network
+        g["over"] = True
+        _log_human_game(g, "error")
+        msg = f"Model error ({type(e).__name__}) — start a new game."
+        yield _hview(g, msg, result="Error"), g
+        return
+    s = g["stats"][ai]
+    s.update(latency=rec["latency"], tokens=s["tokens"] + rec["tokens"],
+             illegal=s["illegal"] + rec["illegal"], reasoning=rec["reasoning"])
+    _record(g, ai, rec["cell"], rec["reasoning"])
+    res = _check_end(g)
+    if res:
+        yield _hview(g, res, result=res), g
+        return
+    g["turn"], g["turn_t0"] = g["human"], time.time()
+    yield _hview(g, "Your move — click a cell"), g
+
+def _abandon(g):
+    # A started game was already counted against the rate limit; log the
+    # partial game so the record isn't silently lost.
+    if g and not g["over"]:
+        g["over"] = True
+        _log_human_game(g, "abandoned")
+
+def start_human(identity, side, model_choice, g_prev):
+    blank_names = {"X": "—", "O": "—"}
+    if not identity:
+        yield view([EMPTY]*9, None, fresh(), blank_names, None,
+                   "Session error — reload.", 0.0, "Error", [], label=HUMAN_LABEL), None
+        return
+    _abandon(g_prev)
+    name, ip, user_id = identity
+    allowed, played = db.check_rate(user_id)
+    if not allowed:
+        yield view([EMPTY]*9, None, fresh(), blank_names, None,
+                   f"Limit reached ({played}/{db.MAX_GAMES}).", 0.0, "Blocked", [],
+                   label=HUMAN_LABEL), None
+        return
+    db.increment_games(user_id, name, ip)       # count this game up front
+
+    ai = "O" if side == "X" else "X"
+    stats = fresh()
+    stats[side]["reasoning"] = "Your turn — pick a cell."
+    g = {"board": [EMPTY]*9, "human": side, "ai": ai, "model": model_choice,
+         "names": {side: f"You ({name})", ai: model_choice},
+         "stats": stats, "log": [], "last": None, "n": 0,
+         "start": time.time(), "turn_t0": time.time(), "turn": "X",
+         "over": False, "identity": identity}
+    if ai == "X":                                # model opens
+        yield from _ai_turn(g)
+    else:
+        yield _hview(g, "Your move — click a cell"), g
+
+def human_move(g, evt: gr.EventData):
+    # Ignore clicks when no human game is running or it's not the human's turn
+    # (e.g. AI-vs-AI mode, finished game, or a stale click while AI thinks).
+    if not g or g["over"] or g["turn"] != g["human"]:
+        yield gr.update(), g
+        return
+    try:
+        cell = int(evt.cell)
+    except (AttributeError, TypeError, ValueError):
+        cell = None
+    if not is_legal(g["board"], cell):
+        yield gr.update(), g
+        return
+    side = g["human"]
+    s = g["stats"][side]
+    s.update(latency=int((time.time() - g["turn_t0"]) * 1000),
+             reasoning=f"You played {cell_label(cell)}.")
+    _record(g, side, cell, "(human move)")
+    res = _check_end(g)
+    if res:
+        yield _hview(g, res, result=res), g
+        return
+    yield from _ai_turn(g)
+
+def switch_mode(mode, g):
+    _abandon(g)
+    human = mode == MODE_HUMAN
+    if human:
+        idle = view([EMPTY]*9, None, fresh(), {"X": "—", "O": "—"}, None,
+                    "Pick your side & opponent, then press Start", 0.0, None, [],
+                    label=HUMAN_LABEL)
+    else:
+        idle = view([EMPTY]*9, None, fresh(), {"X": x_def, "O": o_def},
+                    None, "Press play to start", 0.0, None, [])
+    return gr.update(visible=not human), gr.update(visible=human), idle, None
+
+# Event delegation on the gr.HTML root survives re-renders of its contents.
+BOARD_JS = """
+element.addEventListener('click', (e) => {
+  const hit = e.target.closest('[data-cell]');
+  if (hit) trigger('click', {cell: Number(hit.dataset.cell)});
+});
+"""
+
 CORAL, TEAL = "#e2775a", "#3fb6b6"
 CSS = f"""
 #arena{{font-family:ui-monospace,Menlo,Consolas,monospace;background:#17110d;
@@ -252,6 +401,8 @@ CSS = f"""
 #arena .xg{{stroke:{CORAL};stroke-width:8;stroke-linecap:round}}
 #arena .og{{fill:none;stroke:{TEAL};stroke-width:8}}
 #arena .hl{{fill:#4a2f1e}}
+#arena .hit{{fill:#4a2f1e;fill-opacity:0;pointer-events:all;cursor:pointer}}
+#arena .hit:hover{{fill-opacity:.45}}
 #arena .status{{margin-top:12px;font-size:13px;color:#8a7a6c}}
 #arena .result{{margin-top:10px;font-size:17px;font-weight:700}}
 #arena .logwrap{{margin-top:20px;border-top:1px solid #3a2c22;padding-top:14px}}
@@ -265,18 +416,31 @@ CSS = f"""
 # full-screen: kill Gradio's default max-width on the whole container
 GLOBAL_CSS = ".gradio-container{max-width:100% !important;padding:16px 24px !important}"
 
+MODE_AI, MODE_HUMAN = "🤖 AI vs AI", "🧑 Human vs AI"
+# Each human click blocks a worker while the model answers; allow several
+# players at once instead of Gradio's default of 1 per event.
+HUMAN_CONCURRENCY = int(os.getenv("HUMAN_CONCURRENCY", 8))
+
 choices = list(MODELS)
 x_def = choices[0]
 o_def = choices[1] if len(choices) > 1 else choices[0]
 
-with gr.Blocks(theme=gr.themes.Base(
-        primary_hue="orange", neutral_hue="stone").set(
-        body_background_fill="#17110d",
-        background_fill_primary="#1f1712",
-        block_background_fill="#1f1712",
-        body_text_color="#e8ddd2",
-        input_background_fill="#17110d",
-    ), title="TTT Model Arena", fill_width=True, css=GLOBAL_CSS) as demo:
+# one theme object for both Blocks() and launch(); the checkbox_label_* vars
+# keep radio-button labels (Mode / Play as) readable on the dark background
+THEME = gr.themes.Base(primary_hue="orange", neutral_hue="stone").set(
+    body_background_fill="#17110d",
+    background_fill_primary="#1f1712",
+    block_background_fill="#1f1712",
+    body_text_color="#e8ddd2",
+    input_background_fill="#17110d",
+    checkbox_label_background_fill="#17110d",
+    checkbox_label_background_fill_hover="#2a1f18",
+    checkbox_label_background_fill_selected="#3a2c22",
+    checkbox_label_text_color="#e8ddd2",
+    checkbox_label_text_color_selected="#e8ddd2",
+)
+
+with gr.Blocks(theme=THEME, title="TTT Model Arena", fill_width=True, css=GLOBAL_CSS) as demo:
     gr.Markdown("### Tic-Tac-Toe Model Arena")
     identity = gr.State(None)   # holds (name, ip, user_id) after gate
 
@@ -288,29 +452,40 @@ with gr.Blocks(theme=gr.themes.Base(
 
     # ── Screen 2: arena (hidden until gate passes) ──
     with gr.Group(visible=False) as arena:
-        with gr.Row():
-            x_dd = gr.Dropdown(choices, value=x_def, label="Player X (coral)")
-            o_dd = gr.Dropdown(choices, value=o_def, label="Player O (teal)")
-        play_btn = gr.Button("▶ Play match", variant="primary")
+        mode_rd = gr.Radio([MODE_AI, MODE_HUMAN], value=MODE_AI, label="Mode")
+        with gr.Group(visible=True) as ai_ctrls:          # existing AI-vs-AI controls
+            with gr.Row():
+                x_dd = gr.Dropdown(choices, value=x_def, label="Player X (coral)")
+                o_dd = gr.Dropdown(choices, value=o_def, label="Player O (teal)")
+            play_btn = gr.Button("▶ Play match", variant="primary")
+        with gr.Group(visible=False) as human_ctrls:      # new Human-vs-AI controls
+            with gr.Row():
+                side_rd = gr.Radio(["X", "O"], value="X",
+                                   label="Play as (X moves first)")
+                opp_dd = gr.Dropdown(choices, value=x_def, label="Opponent model")
+            start_btn = gr.Button("▶ Start game", variant="primary")
         out = gr.HTML(view([EMPTY]*9, None, fresh(), {"X":x_def,"O":o_def},
-                           None, "Press play to start", 0.0, None, []))
+                           None, "Press play to start", 0.0, None, []),
+                      js_on_load=BOARD_JS)
+    hgame = gr.State(None)      # current human-vs-model game (see start_human)
 
     enter_btn.click(enter, [name_in],
                     [gate, name_in, status_md, identity, arena])
     play_btn.click(play, [identity, x_dd, o_dd], out).then(
     refresh_status, [identity], status_md)
 
+    mode_rd.change(switch_mode, [mode_rd, hgame], [ai_ctrls, human_ctrls, out, hgame])
+    start_btn.click(start_human, [identity, side_rd, opp_dd, hgame], [out, hgame],
+                    concurrency_limit=HUMAN_CONCURRENCY).then(
+        refresh_status, [identity], status_md)
+    out.click(human_move, [hgame], [out, hgame], concurrency_limit=HUMAN_CONCURRENCY)
+
 if __name__ == "__main__":
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        theme=gr.themes.Base(
-            primary_hue="orange", neutral_hue="stone").set(
-            body_background_fill="#17110d",
-            background_fill_primary="#1f1712",
-            block_background_fill="#1f1712",
-            body_text_color="#e8ddd2",
-            input_background_fill="#17110d",
-        ),
+        # HOST=127.0.0.1 when nginx fronts the app (see deploy/), so the
+        # only way in is through the proxy that sets the real client IP.
+        server_name=os.getenv("HOST", "0.0.0.0"),
+        server_port=int(os.getenv("PORT", 7860)),
+        theme=THEME,
         css=GLOBAL_CSS,
     )

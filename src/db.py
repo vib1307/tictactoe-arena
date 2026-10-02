@@ -85,12 +85,14 @@ def increment_games(user_id, name, ip):
         )
 
 # ── 3. Store the full game record (called when a game ends) ───────────────────
-def log_game(user_id, name, ip, x_model, o_model, winner, reasoning_log):
+def log_game(user_id, name, ip, x_model, o_model, winner, reasoning_log,
+             mode="ai_vs_ai"):
     games_table.put_item(Item={
         "game_id": str(uuid.uuid4()),          # Unique id for this game.
         "user_id": user_id, "name": name, "ip": ip,
         "x_model": x_model, "o_model": o_model,
-        "winner": winner,                      # "X" / "O" / "draw"
+        "mode": mode,                          # "ai_vs_ai" / "human_vs_ai"
+        "winner": winner,                      # "X"/"O"/"draw" (+ "abandoned"/"error" for human games)
         "reasoning_log": reasoning_log,        # List of {n, side, cell, reasoning}.
         "created_at": _now_iso(),
         "expires_at": _now_epoch() + RETENTION_DAYS * 86400,   # 15-day TTL.

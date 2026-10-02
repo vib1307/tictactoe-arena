@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ArenaTablesReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:CreateTable",
+        "dynamodb:UpdateTimeToLive"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/ttt_users",
+        "arn:aws:dynamodb:*:*:table/ttt_games"
+      ]
+    },
+    {
+      "Sid": "EnsureTablesStartupCheck",
+      "Effect": "Allow",
+      "Action": "dynamodb:ListTables",
+      "Resource": "*"
+    }
+  ]
+}
